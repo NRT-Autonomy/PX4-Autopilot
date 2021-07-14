@@ -196,3 +196,8 @@ CONFIG:
       buildType: MinSizeRel
       settings:
         CONFIG: nxp_fmuk66-v3_default
+    yuneec_mantis-edu_default:
+      short: yuneec_mantis-edu
+      buildType: MinSizeRel
+      settings:
+        CONFIG: yuneec_mantis-edu_default
