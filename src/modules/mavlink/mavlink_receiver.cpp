@@ -933,7 +933,8 @@ MavlinkReceiver::handle_message_set_position_target_local_ned(mavlink_message_t 
 
 		offboard_control_mode_s ocm{};
 		ocm.position = PX4_ISFINITE(setpoint.x) || PX4_ISFINITE(setpoint.y) || PX4_ISFINITE(setpoint.z);
-		ocm.velocity = PX4_ISFINITE(setpoint.vx) || PX4_ISFINITE(setpoint.vy) || PX4_ISFINITE(setpoint.vz);
+		// ocm.velocity = PX4_ISFINITE(setpoint.vx) || PX4_ISFINITE(setpoint.vy) || PX4_ISFINITE(setpoint.vz);
+		ocm.velocity = PX4_ISFINITE(setpoint.vx) || PX4_ISFINITE(setpoint.vy);
 		ocm.acceleration = PX4_ISFINITE(setpoint.acceleration[0]) || PX4_ISFINITE(setpoint.acceleration[1])
 				   || PX4_ISFINITE(setpoint.acceleration[2]);
 
@@ -941,6 +942,7 @@ MavlinkReceiver::handle_message_set_position_target_local_ned(mavlink_message_t 
 			mavlink_log_critical(&_mavlink_log_pub, "SET_POSITION_TARGET_LOCAL_NED force not supported");
 			return;
 		}
+
 
 		if (ocm.position || ocm.velocity || ocm.acceleration) {
 			// publish offboard_control_mode
@@ -951,12 +953,110 @@ MavlinkReceiver::handle_message_set_position_target_local_ned(mavlink_message_t 
 			_vehicle_status_sub.copy(&vehicle_status);
 
 			if (vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_OFFBOARD) {
-				// only publish setpoint once in OFFBOARD
-				setpoint.timestamp = hrt_absolute_time();
-				_trajectory_setpoint_pub.publish(setpoint);
-			}
 
-		} else {
+
+				// raghu changes
+				position_setpoint_triplet_s pos_sp_triplet{};
+
+				pos_sp_triplet.timestamp = hrt_absolute_time();
+				pos_sp_triplet.previous.valid = false;
+				pos_sp_triplet.next.valid = false;
+				pos_sp_triplet.current.valid = true;
+				PX4_WARN("type: %d", type_mask);
+				if(type_mask & 12288){
+					pos_sp_triplet.current.type = position_setpoint_s::SETPOINT_TYPE_LOITER;
+				}
+				else if(type_mask & 4096){
+					PX4_WARN("Taking off!");
+					pos_sp_triplet.current.type = position_setpoint_s::SETPOINT_TYPE_TAKEOFF;
+				}
+				else if(type_mask & 8192){
+					pos_sp_triplet.current.type = position_setpoint_s::SETPOINT_TYPE_LAND;
+				}
+				else if(type_mask & 16384){
+					pos_sp_triplet.current.type = position_setpoint_s::SETPOINT_TYPE_IDLE;
+				}
+				else if (type_mask & 3043){
+					PX4_WARN("Raghu1");
+					pos_sp_triplet.current.type = position_setpoint_s::SETPOINT_TYPE_VELOCITY;
+				}
+				else {
+					pos_sp_triplet.current.type = position_setpoint_s::SETPOINT_TYPE_POSITION;
+				}
+
+				/* convert mavlink type (local, NED) to uORB offboard control struct */
+				bool ignore_position = (bool)(type_mask & 0x7);
+				bool ignore_alt_hold = (bool)(type_mask & 0x4);
+				bool ignore_velocity = (bool)(type_mask & 0x18);
+				// bool ignore_acceleration_force = (bool)(type_mask & 0x1C0);
+				bool ignore_attitude = (bool)(type_mask & 0x400);
+				bool ignore_bodyrate_x = (bool)(type_mask & 0x800);
+				bool ignore_bodyrate_y = (bool)(type_mask & 0x800);
+				bool ignore_bodyrate_z = (bool)(type_mask & 0x800);
+				/* set the local pos values */
+								/* set the local pos values */
+				if (!ignore_position) {
+					// only publish setpoint once in OFFBOARD
+					PX4_WARN("Raghu2");
+					setpoint.timestamp = hrt_absolute_time();
+					_trajectory_setpoint_pub.publish(setpoint);
+
+				}
+				/* set the local vel values */
+				if (!ignore_velocity) {
+					PX4_WARN("Raghu3");
+					pos_sp_triplet.current.velocity_valid = true;
+					pos_sp_triplet.current.vx = setpoint.vx;
+					pos_sp_triplet.current.vy = setpoint.vy;
+					pos_sp_triplet.current.vz = setpoint.vz;
+
+					pos_sp_triplet.current.alt_valid = true;
+					pos_sp_triplet.current.alt = 150.0;
+
+					pos_sp_triplet.current.velocity_frame = target_local_ned.coordinate_frame;
+
+				} else {
+					pos_sp_triplet.current.velocity_valid = false;
+				}
+				if (! ignore_alt_hold) {
+					PX4_WARN("Raghu4");
+					pos_sp_triplet.current.alt_valid = true;
+					pos_sp_triplet.current.alt = 150.0;
+					// std::cout << pos_sp_triplet.current.alt << std::endl;
+				} else {
+					PX4_WARN("Raghu5");
+					pos_sp_triplet.current.alt_valid = false;
+				}
+
+				/* set the yaw sp value */
+				if (!ignore_attitude) {
+					pos_sp_triplet.current.yaw_valid = true;
+					pos_sp_triplet.current.yaw = setpoint.yaw;
+
+				} else {
+					pos_sp_triplet.current.yaw_valid = false;
+				}
+
+				/* set the yawrate sp value */
+				if (!(ignore_bodyrate_x ||
+					ignore_bodyrate_y ||
+					ignore_bodyrate_z)) {
+
+					pos_sp_triplet.current.yawspeed_valid = true;
+					pos_sp_triplet.current.yawspeed = setpoint.yawspeed;
+
+				} else {
+					pos_sp_triplet.current.yawspeed_valid = false;
+				}
+
+				//XXX handle global pos setpoints (different MAV frames)
+				PX4_WARN("Raghu4 %d", pos_sp_triplet.current.valid);
+				_pos_sp_triplet_pub.publish(pos_sp_triplet);
+			}
+		}
+
+
+		else {
 			mavlink_log_critical(&_mavlink_log_pub, "SET_POSITION_TARGET_LOCAL_NED invalid");
 		}
 	}
