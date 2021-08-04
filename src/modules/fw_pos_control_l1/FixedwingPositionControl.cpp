@@ -694,6 +694,51 @@ FixedwingPositionControl::control_position(const hrt_abstime &now, const Vector2
 						   false,
 						   radians(_param_fw_p_lim_min.get()));
 
+		}
+		//Adding the velocity commands to PX4 (Rajan : rajan.gupta@newspace.co.in)
+		else if (pos_sp_curr.type == position_setpoint_s::SETPOINT_TYPE_VELOCITY) {
+			// this is actually altitude, speed, and course
+
+			if (!pos_sp_curr.velocity_valid || !pos_sp_curr.alt_valid) {
+				return false;
+			}
+			Vector2f vel_sp = Vector2f(pos_sp_curr.vx, pos_sp_curr.vy);
+			if (vel_sp.length()<1.0e-3f) {
+				if (!pos_sp_curr.yaw_valid) {
+					return false; 	// we cannot compute the target course (bearing)
+				}
+				_target_bearing = pos_sp_curr.yaw;
+			} else {
+				_target_bearing = atan2f(vel_sp(1), vel_sp(0));
+			}
+			float current_bearing;
+			if (ground_speed.length()<1.0e-3f) {
+				current_bearing = _yaw;
+			} else {
+			 	current_bearing = atan2f(ground_speed(1), ground_speed(0));
+			}
+			_l1_control.navigate_heading(_target_bearing, current_bearing, ground_speed);
+			_att_sp.roll_body = _l1_control.get_roll_setpoint();
+			_att_sp.yaw_body = _l1_control.nav_bearing();
+
+			// tecs_update_pitch_throttle(pos_sp_curr.alt,
+			// 			   calculate_target_airspeed(vel_sp.length(), ground_speed),
+			// 			   radians(_parameters.pitch_limit_min) - _parameters.pitchsp_offset_rad,
+			// 			   radians(_parameters.pitch_limit_max) - _parameters.pitchsp_offset_rad,
+			// 			   _parameters.throttle_min,
+			// 			   _parameters.throttle_max,
+			// 			   mission_throttle,
+			// 			   false,
+			// 			   radians(_parameters.pitch_limit_min));
+			tecs_update_pitch_throttle(now, pos_sp_curr.alt,
+						   calculate_target_airspeed(vel_sp.length(), ground_speed),
+						   radians(_param_fw_p_lim_min.get()) - radians(_param_fw_psp_off.get()),
+						   radians(_param_fw_p_lim_max.get()) - radians(_param_fw_psp_off.get()),
+						   _param_fw_thr_min.get(),
+						   _param_fw_thr_max.get(),
+						   mission_throttle,
+						   false,
+						   radians(_param_fw_p_lim_min.get()));
 		} else if (pos_sp_curr.type == position_setpoint_s::SETPOINT_TYPE_LOITER) {
 
 			/* waypoint is a loiter waypoint */

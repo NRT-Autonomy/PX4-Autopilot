@@ -797,20 +797,23 @@ MavlinkReceiver::handle_message_set_position_target_local_ned(mavlink_message_t 
 		/* convert mavlink type (local, NED) to uORB offboard control struct */
 		offboard_control_mode.ignore_position = (bool)(set_position_target_local_ned.type_mask & 0x7);
 		offboard_control_mode.ignore_alt_hold = (bool)(set_position_target_local_ned.type_mask & 0x4);
-		offboard_control_mode.ignore_velocity = (bool)(set_position_target_local_ned.type_mask & 0x38);
+		//Changing the type mask value to enable velocity commands
+		offboard_control_mode.ignore_velocity = (bool)(set_position_target_local_ned.type_mask & 0x18);
 		offboard_control_mode.ignore_acceleration_force = (bool)(set_position_target_local_ned.type_mask & 0x1C0);
 		offboard_control_mode.ignore_attitude = (bool)(set_position_target_local_ned.type_mask & 0x400);
 		offboard_control_mode.ignore_bodyrate_x = (bool)(set_position_target_local_ned.type_mask & 0x800);
 		offboard_control_mode.ignore_bodyrate_y = (bool)(set_position_target_local_ned.type_mask & 0x800);
 		offboard_control_mode.ignore_bodyrate_z = (bool)(set_position_target_local_ned.type_mask & 0x800);
 
-		/* yaw ignore flag mapps to ignore_attitude */
+		/* yaw ignore flag maps to ignore_attitude */
 		bool is_force_sp = (bool)(set_position_target_local_ned.type_mask & (1 << 9));
 
 		bool is_takeoff_sp = (bool)(set_position_target_local_ned.type_mask & 0x1000);
 		bool is_land_sp = (bool)(set_position_target_local_ned.type_mask & 0x2000);
 		bool is_loiter_sp = (bool)(set_position_target_local_ned.type_mask & 0x3000);
 		bool is_idle_sp = (bool)(set_position_target_local_ned.type_mask & 0x4000);
+		bool is_alt_vel_sp = (!offboard_control_mode.ignore_alt_hold) & (!offboard_control_mode.ignore_velocity)
+								& offboard_control_mode.ignore_position;
 
 		offboard_control_mode.timestamp = hrt_absolute_time();
 		_offboard_control_mode_pub.publish(offboard_control_mode);
@@ -851,7 +854,12 @@ MavlinkReceiver::handle_message_set_position_target_local_ned(mavlink_message_t 
 					} else if (is_idle_sp) {
 						pos_sp_triplet.current.type = position_setpoint_s::SETPOINT_TYPE_IDLE;
 
-					} else {
+					}
+					//Adding the velocity commands to PX4 (Rajan)
+					else if (is_alt_vel_sp) {
+						pos_sp_triplet.current.type = position_setpoint_s::SETPOINT_TYPE_VELOCITY;
+
+					}else {
 						pos_sp_triplet.current.type = position_setpoint_s::SETPOINT_TYPE_POSITION;
 					}
 
