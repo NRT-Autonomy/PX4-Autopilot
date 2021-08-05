@@ -856,7 +856,52 @@ FixedwingPositionControl::control_position(const hrt_abstime &now, const Vector2
 						   tecs_fw_mission_throttle,
 						   false,
 						   radians(_param_fw_p_lim_min.get()));
+		
+		} else if (position_sp_type == position_setpoint_s::SETPOINT_TYPE_VELOCITY) {
+			// this is actually altitude, speed, and course
+			if (!pos_sp_curr.velocity_valid || !pos_sp_curr.alt_valid) {
+				return false;
+			}
+			Vector2f vel_sp = Vector2f(pos_sp_curr.vx, pos_sp_curr.vy);
+			if (vel_sp.length()<1.0e-3f) {
+				if (!pos_sp_curr.yaw_valid) {
+					return false; 	// we cannot compute the target course (bearing)
+				}
+				_target_bearing = pos_sp_curr.yaw;
+			} else {
+				_target_bearing = atan2f(vel_sp(1), vel_sp(0));
+			}
+			float current_bearing;
+			if (ground_speed.length()<1.0e-3f) {
+				current_bearing = _yaw;
+			} else {
+			 	current_bearing = atan2f(ground_speed(1), ground_speed(0));
+			}
+			_l1_control.navigate_heading(_target_bearing, current_bearing, ground_speed);
+			_att_sp.roll_body = _l1_control.get_roll_setpoint();
+			_att_sp.yaw_body = _l1_control.nav_bearing();
 
+			tecs_update_pitch_throttle(now, pos_sp_curr.alt,
+						   calculate_target_airspeed(vel_sp.length(), ground_speed),
+						   radians(_param_fw_p_lim_min.get()),
+						   radians(_param_fw_p_lim_max.get()),
+						   tecs_fw_thr_min,
+						   tecs_fw_thr_max,
+						   tecs_fw_mission_throttle,
+						   false,
+						   radians(_param_fw_p_lim_min.get()));
+
+			// publish the command in the debug vector
+			debug_vect_s asc = {};
+			asc.timestamp = hrt_absolute_time();
+			asc.name[0] = 'a';
+			asc.name[1] = 's';
+			asc.name[2] = 'c';
+			asc.name[3] = '\0';
+			asc.x = pos_sp_curr.alt;
+			asc.y = vel_sp.length();
+			asc.z = math::degrees(_target_bearing);
+			_debug_vect_pub.publish(asc);
 
 		} else if (position_sp_type == position_setpoint_s::SETPOINT_TYPE_LOITER) {
 			/* waypoint is a loiter waypoint */
@@ -1719,7 +1764,25 @@ FixedwingPositionControl::Run()
 						_pos_sp_triplet.current.cruising_throttle = NAN; // ignored
 					}
 
-				} else {
+				} else if (PX4_ISFINITE(trajectory_setpoint.vx) && PX4_ISFINITE(trajectory_setpoint.vy) && PX4_ISFINITE(trajectory_setpoint.z)) {
+					_pos_sp_triplet.timestamp = trajectory_setpoint.timestamp;
+					_pos_sp_triplet.current.timestamp = trajectory_setpoint.timestamp;
+					_pos_sp_triplet.current.valid = true;
+					_pos_sp_triplet.current.type = position_setpoint_s::SETPOINT_TYPE_VELOCITY;
+					_pos_sp_triplet.current.alt_valid = true;
+					_pos_sp_triplet.current.alt = _global_local_alt0 - trajectory_setpoint.z;
+					_pos_sp_triplet.current.velocity_valid = true;
+					_pos_sp_triplet.current.velocity_frame = position_setpoint_s::VELOCITY_FRAME_LOCAL_NED;
+					_pos_sp_triplet.current.vx = trajectory_setpoint.vx;
+					_pos_sp_triplet.current.vy = trajectory_setpoint.vy;
+					_pos_sp_triplet.current.cruising_speed = sqrtf(trajectory_setpoint.vx*trajectory_setpoint.vx
+							+trajectory_setpoint.vy*trajectory_setpoint.vy);
+					_pos_sp_triplet.current.yaw_valid = true;
+					_pos_sp_triplet.current.yaw = trajectory_setpoint.yaw;
+					_pos_sp_triplet.current.lat = (double)NAN;
+					_pos_sp_triplet.current.lon = (double)NAN;
+					_pos_sp_triplet.current.cruising_throttle = NAN; // ignored
+				} else	{
 					mavlink_log_critical(&_mavlink_log_pub, "Invalid offboard setpoint");
 				}
 			}

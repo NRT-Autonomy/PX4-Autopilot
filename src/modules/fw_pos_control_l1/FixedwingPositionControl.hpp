@@ -87,6 +87,7 @@
 #include <uORB/topics/vehicle_local_position.h>
 #include <uORB/topics/vehicle_local_position_setpoint.h>
 #include <uORB/topics/vehicle_status.h>
+#include <uORB/topics/debug_vect.h>
 #include <uORB/uORB.h>
 #include <vtol_att_control/vtol_type.h>
 
@@ -156,7 +157,8 @@ private:
 	uORB::Publication<position_controller_status_s>		_pos_ctrl_status_pub{ORB_ID(position_controller_status)};			///< navigation capabilities publication
 	uORB::Publication<position_controller_landing_status_s>	_pos_ctrl_landing_status_pub{ORB_ID(position_controller_landing_status)};	///< landing status publication
 	uORB::Publication<tecs_status_s>			_tecs_status_pub{ORB_ID(tecs_status)};						///< TECS status publication
-
+	uORB::Publication<debug_vect_s> 			_debug_vect_pub{ORB_ID(debug_vect)};
+	
 	manual_control_setpoint_s	_manual_control_setpoint {};			///< r/c channel data
 	position_setpoint_triplet_s	_pos_sp_triplet {};		///< triplet of mission items
 	vehicle_attitude_setpoint_s	_att_sp {};			///< vehicle attitude setpoint
