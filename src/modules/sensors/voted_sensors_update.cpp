@@ -1,6 +1,6 @@
 /****************************************************************************
  *
- *   Copyright (c) 2016 PX4 Development Team. All rights reserved.
+ *   Copyright (c) 2016, 2021 PX4 Development Team. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -106,7 +106,8 @@ void VotedSensorsUpdate::parametersUpdate()
 					} else {
 						// change relative priority to incorporate any sensor faults
 						int priority_change = _accel.priority_configured[uorb_index] - accel_priority_old;
-						_accel.priority[uorb_index] = math::constrain(_accel.priority[uorb_index] + priority_change, 1, 100);
+						_accel.priority[uorb_index] = math::constrain(_accel.priority[uorb_index] + priority_change, static_cast<int32_t>(1),
+									      static_cast<int32_t>(100));
 					}
 				}
 			}
@@ -128,7 +129,8 @@ void VotedSensorsUpdate::parametersUpdate()
 					} else {
 						// change relative priority to incorporate any sensor faults
 						int priority_change = _gyro.priority_configured[uorb_index] - gyro_priority_old;
-						_gyro.priority[uorb_index] = math::constrain(_gyro.priority[uorb_index] + priority_change, 1, 100);
+						_gyro.priority[uorb_index] = math::constrain(_gyro.priority[uorb_index] + priority_change, static_cast<int32_t>(1),
+									     static_cast<int32_t>(100));
 					}
 				}
 			}
@@ -185,6 +187,8 @@ void VotedSensorsUpdate::imuPoll(struct sensor_combined_s &raw)
 	// find the best sensor
 	int accel_best_index = -1;
 	int gyro_best_index = -1;
+	_accel.voter.get_best(hrt_absolute_time(), &accel_best_index);
+	_gyro.voter.get_best(hrt_absolute_time(), &gyro_best_index);
 
 	if (!_param_sens_imu_mode.get() && ((_selection.timestamp != 0) || (_sensor_selection_sub.updated()))) {
 		// use sensor_selection to find best
@@ -211,9 +215,6 @@ void VotedSensorsUpdate::imuPoll(struct sensor_combined_s &raw)
 
 	} else {
 		// use sensor voter to find best if SENS_IMU_MODE is enabled or ORB_ID(sensor_selection) has never published
-		_accel.voter.get_best(hrt_absolute_time(), &accel_best_index);
-		_gyro.voter.get_best(hrt_absolute_time(), &gyro_best_index);
-
 		checkFailover(_accel, "Accel");
 		checkFailover(_gyro, "Gyro");
 	}
@@ -355,11 +356,11 @@ void VotedSensorsUpdate::initSensorClass(SensorData &sensor_data, uint8_t sensor
 
 void VotedSensorsUpdate::printStatus()
 {
-	PX4_INFO("selected gyro: %d (%d)", _selection.gyro_device_id, _gyro.last_best_vote);
+	PX4_INFO("selected gyro: %" PRIu32 " (%" PRIu8 ")", _selection.gyro_device_id, _gyro.last_best_vote);
 	_gyro.voter.print();
 
 	PX4_INFO_RAW("\n");
-	PX4_INFO("selected accel: %d (%d)", _selection.accel_device_id, _accel.last_best_vote);
+	PX4_INFO("selected accel: %" PRIu32 " (%" PRIu8 ")", _selection.accel_device_id, _accel.last_best_vote);
 	_accel.voter.print();
 }
 
