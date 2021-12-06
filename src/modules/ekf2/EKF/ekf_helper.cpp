@@ -1320,9 +1320,8 @@ void Ekf::updateBaroHgtOffset()
 
 		// apply a 10 second first order low pass filter to baro offset
 		const float unbiased_baro = _baro_sample_delayed.hgt - _baro_b_est.getBias();
-;
-		const float offset_rate_correction =  0.1f * (unbiased_baro + _state.pos(2) -
-								_baro_hgt_offset);
+
+		const float offset_rate_correction = 0.1f * (unbiased_baro + _state.pos(2) - _baro_hgt_offset);
 		_baro_hgt_offset += local_time_step * math::constrain(offset_rate_correction, -0.1f, 0.1f);
 	}
 }
@@ -1348,7 +1347,7 @@ void Ekf::updateBaroHgtBias()
 	}
 
 	if (_gps_data_ready && !_gps_hgt_intermittent
-	    && _gps_checks_passed &&_NED_origin_initialised
+	    && _gps_checks_passed && _NED_origin_initialised
 	    && !_baro_hgt_faulty) {
 		// Use GPS altitude as a reference to compute the baro bias measurement
 		const float baro_bias = (_baro_sample_delayed.hgt - _baro_hgt_offset)
@@ -1356,16 +1355,6 @@ void Ekf::updateBaroHgtBias()
 		const float baro_bias_var = getGpsHeightVariance() + sq(_params.baro_noise);
 		_baro_b_est.fuseBias(baro_bias, baro_bias_var);
 	}
-}
-
-void Ekf::getBaroBiasEstimatorStatus(float &bias, float &bias_var, float &innov, float &innov_var, float &innov_test_ratio)
-{
-	BaroBiasEstimator::status status = _baro_b_est.getStatus();
-	bias = status.bias;
-	bias_var = status.bias_var;
-	innov = status.innov;
-	innov_var = status.innov_var;
-	innov_test_ratio = status.innov_test_ratio;
 }
 
 Vector3f Ekf::getVisionVelocityInEkfFrame() const
@@ -1491,6 +1480,24 @@ void Ekf::loadMagCovData()
 	P.slice<2, 2>(16, 16) = _saved_mag_ef_covmat;
 }
 
+void Ekf::startAirspeedFusion()
+{
+	// If starting wind state estimation, reset the wind states and covariances before fusing any data
+	if (!_control_status.flags.wind) {
+		// activate the wind states
+		_control_status.flags.wind = true;
+		// reset the wind speed states and corresponding covariances
+		resetWindUsingAirspeed();
+	}
+
+	_control_status.flags.fuse_aspd = true;
+}
+
+void Ekf::stopAirspeedFusion()
+{
+	_control_status.flags.fuse_aspd = false;
+}
+
 void Ekf::startGpsFusion()
 {
 	resetHorizontalPositionToGps();
@@ -1508,9 +1515,14 @@ void Ekf::startGpsFusion()
 
 void Ekf::stopGpsFusion()
 {
-	stopGpsPosFusion();
-	stopGpsVelFusion();
-	stopGpsYawFusion();
+	if (_control_status.flags.gps) {
+		stopGpsPosFusion();
+		stopGpsVelFusion();
+	}
+
+	if (_control_status.flags.gps_yaw) {
+		stopGpsYawFusion();
+	}
 
 	// We do not need to know the true North anymore
 	// EV yaw can start again
@@ -1520,7 +1532,11 @@ void Ekf::stopGpsFusion()
 void Ekf::stopGpsPosFusion()
 {
 	_control_status.flags.gps = false;
-	_control_status.flags.gps_hgt = false;
+
+	if (_control_status.flags.gps_hgt) {
+		startBaroHgtFusion();
+	}
+
 	_gps_pos_innov.setZero();
 	_gps_pos_innov_var.setZero();
 	_gps_pos_test_ratio.setZero();
@@ -1535,11 +1551,15 @@ void Ekf::stopGpsVelFusion()
 
 void Ekf::startGpsYawFusion()
 {
-	_control_status.flags.mag_dec = false;
-	stopEvYawFusion();
-	stopMagHdgFusion();
-	stopMag3DFusion();
-	_control_status.flags.gps_yaw = true;
+	if (resetYawToGps()) {
+		_control_status.flags.yaw_align = true;
+		_control_status.flags.mag_dec = false;
+		stopEvYawFusion();
+		stopMagHdgFusion();
+		stopMag3DFusion();
+		_control_status.flags.gps_yaw = true;
+	}
+
 }
 
 void Ekf::stopGpsYawFusion()
@@ -1691,16 +1711,32 @@ bool Ekf::resetYawToEKFGSF()
 	_flt_mag_align_start_time = _imu_sample_delayed.time_us;
 	_control_status.flags.yaw_align = true;
 
-	if (_params.mag_fusion_type == MAG_FUSE_TYPE_NONE) {
+	const bool is_mag_fusion_active = _control_status.flags.mag_hdg
+	                                  || _control_status.flags.mag_3D;
+	const bool is_yaw_aiding_active = is_mag_fusion_active
+	                                  || _control_status.flags.gps_yaw
+					  || _control_status.flags.ev_yaw;
+
+	if (!is_yaw_aiding_active) {
 		_information_events.flags.yaw_aligned_to_imu_gps = true;
 		ECL_INFO("Yaw aligned using IMU and GPS");
 
 	} else {
-		// stop using the magnetometer in the main EKF otherwise it's fusion could drag the yaw around
-		// and cause another navigation failure
-		_control_status.flags.mag_fault = true;
-		_warning_events.flags.emergency_yaw_reset_mag_stopped = true;
-		ECL_WARN("Emergency yaw reset - mag use stopped");
+		if (is_mag_fusion_active) {
+			// stop using the magnetometer in the main EKF otherwise it's fusion could drag the yaw around
+			// and cause another navigation failure
+			_control_status.flags.mag_fault = true;
+			_warning_events.flags.emergency_yaw_reset_mag_stopped = true;
+
+		} else if (_control_status.flags.gps_yaw) {
+			_control_status.flags.gps_yaw_fault = true;
+			_warning_events.flags.emergency_yaw_reset_gps_yaw_stopped = true;
+
+		} else if (_control_status.flags.ev_yaw) {
+			_inhibit_ev_yaw_use = true;
+		}
+
+		ECL_WARN("Emergency yaw reset");
 	}
 
 	return true;
@@ -1714,13 +1750,15 @@ bool Ekf::getDataEKFGSF(float *yaw_composite, float *yaw_variance, float yaw[N_M
 
 void Ekf::runYawEKFGSF()
 {
-	float TAS;
+	float TAS = 0.f;
 
-	if (isTimedOut(_airspeed_sample_delayed.time_us, 1000000) && _control_status.flags.fixed_wing) {
-		TAS = _params.EKFGSF_tas_default;
+	if (_control_status.flags.fixed_wing) {
+		if (isTimedOut(_airspeed_sample_delayed.time_us, 1000000)) {
+			TAS = _params.EKFGSF_tas_default;
 
-	} else {
-		TAS = _airspeed_sample_delayed.true_airspeed;
+		} else if (_airspeed_sample_delayed.true_airspeed >= _params.arsp_thr) {
+			TAS = _airspeed_sample_delayed.true_airspeed;
+		}
 	}
 
 	const Vector3f imu_gyro_bias = getGyroBias();

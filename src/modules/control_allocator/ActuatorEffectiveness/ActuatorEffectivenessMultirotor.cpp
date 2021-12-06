@@ -41,21 +41,16 @@
 
 #include "ActuatorEffectivenessMultirotor.hpp"
 
-ActuatorEffectivenessMultirotor::ActuatorEffectivenessMultirotor():
-	ModuleParams(nullptr)
+ActuatorEffectivenessMultirotor::ActuatorEffectivenessMultirotor(ModuleParams *parent):
+	ModuleParams(parent)
 {
 }
 
 bool
-ActuatorEffectivenessMultirotor::getEffectivenessMatrix(matrix::Matrix<float, NUM_AXES, NUM_ACTUATORS> &matrix)
+ActuatorEffectivenessMultirotor::getEffectivenessMatrix(matrix::Matrix<float, NUM_AXES, NUM_ACTUATORS> &matrix,
+		bool force)
 {
-	// Check if parameters have changed
-	if (_updated || _parameter_update_sub.updated()) {
-		// clear update
-		parameter_update_s param_update;
-		_parameter_update_sub.copy(&param_update);
-
-		updateParams();
+	if (_updated || force) {
 		_updated = false;
 
 		// Get multirotor geometry
@@ -132,6 +127,8 @@ ActuatorEffectivenessMultirotor::getEffectivenessMatrix(matrix::Matrix<float, NU
 		geometry.rotors[7].thrust_coef = _param_ca_mc_r7_ct.get();
 		geometry.rotors[7].moment_ratio = _param_ca_mc_r7_km.get();
 
+		geometry.num_rotors = _param_ca_mc_r_count.get();
+
 		_num_actuators = computeEffectivenessMatrix(geometry, matrix);
 		return true;
 	}
@@ -147,7 +144,8 @@ ActuatorEffectivenessMultirotor::computeEffectivenessMatrix(const MultirotorGeom
 
 	effectiveness.setZero();
 
-	for (size_t i = 0; i < NUM_ROTORS_MAX; i++) {
+	for (int i = 0; i < math::min(NUM_ROTORS_MAX, geometry.num_rotors); i++) {
+
 		// Get rotor axis
 		matrix::Vector3f axis(
 			geometry.rotors[i].axis_x,
@@ -192,9 +190,9 @@ ActuatorEffectivenessMultirotor::computeEffectivenessMatrix(const MultirotorGeom
 			effectiveness(j, i) = moment(j);
 			effectiveness(j + 3, i) = thrust(j);
 		}
-
-		num_actuators = i + 1;
 	}
+
+	num_actuators = geometry.num_rotors;
 
 	return num_actuators;
 }

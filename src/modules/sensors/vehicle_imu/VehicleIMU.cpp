@@ -34,6 +34,7 @@
 #include "VehicleIMU.hpp"
 
 #include <px4_platform_common/log.h>
+#include <px4_platform_common/events.h>
 #include <lib/systemlib/mavlink_log.h>
 
 #include <float.h>
@@ -140,13 +141,24 @@ void VehicleIMU::Run()
 {
 	const hrt_abstime now_us = hrt_absolute_time();
 
-	// backup schedule
-	ScheduleDelayed(_backup_schedule_timeout_us);
-
 	ParametersUpdate();
 
 	if (!_accel_calibration.enabled() || !_gyro_calibration.enabled()) {
+		_sensor_gyro_sub.unregisterCallback();
+		ScheduleDelayed(1_s);
 		return;
+	}
+
+	// backup schedule
+	ScheduleDelayed(_backup_schedule_timeout_us);
+
+	// check vehicle status for changes to armed state
+	if (_vehicle_control_mode_sub.updated()) {
+		vehicle_control_mode_s vehicle_control_mode;
+
+		if (_vehicle_control_mode_sub.copy(&vehicle_control_mode)) {
+			_armed = vehicle_control_mode.flag_armed;
+		}
 	}
 
 	// reset data gap monitor
@@ -209,14 +221,19 @@ void VehicleIMU::Run()
 
 				_gyro_update_latency_mean.update(Vector2f{time_run_s - _gyro_timestamp_sample_last * 1e-6f, time_run_s - _gyro_timestamp_last * 1e-6f});
 
-				return;
+				break;
 			}
 		}
 
 		// finish if there are no more updates, but didn't publish
 		if (!updated) {
-			return;
+			break;
 		}
+	}
+
+	if (hrt_elapsed_time(&_in_flight_calibration_check_timestamp_last) > 1_s) {
+		SensorCalibrationUpdate();
+		_in_flight_calibration_check_timestamp_last = hrt_absolute_time();
 	}
 }
 
@@ -237,35 +254,61 @@ bool VehicleIMU::UpdateAccel()
 
 		} else {
 			// collect sample interval average for filters
-			if (_accel_timestamp_sample_last != 0) {
-				float interval_us = accel.timestamp_sample - _accel_timestamp_sample_last;
-				_accel_interval_mean.update(Vector2f{interval_us, interval_us / accel.samples});
+			if (accel.timestamp_sample > _accel_timestamp_sample_last) {
+				if ((_accel_timestamp_sample_last != 0) && (accel.samples > 0)) {
+					float interval_us = accel.timestamp_sample - _accel_timestamp_sample_last;
+					_accel_interval_mean.update(Vector2f{interval_us, interval_us / accel.samples});
+				}
+
+			} else {
+				PX4_ERR("%d - accel %" PRIu32 " timestamp error timestamp_sample: %" PRIu64 ", previous timestamp_sample: %" PRIu64,
+					_instance, accel.device_id, accel.timestamp_sample, _accel_timestamp_sample_last);
 			}
 
-			if (_accel_interval_mean.valid() && (_accel_interval_mean.count() > 100 || !PX4_ISFINITE(_accel_interval_best_variance))
-			    && ((_accel_interval_mean.variance()(0) < _accel_interval_best_variance) || (_accel_interval_mean.count() > 1000))) {
+			if (accel.timestamp < accel.timestamp_sample) {
+				PX4_ERR("%d - accel %" PRIu32 " timestamp (%" PRIu64 ") < timestamp_sample (%" PRIu64 ")",
+					_instance, accel.device_id, accel.timestamp, accel.timestamp_sample);
+			}
+
+			const int interval_count = _accel_interval_mean.count();
+			const float interval_variance = _accel_interval_mean.variance()(0);
+
+			// check measured interval periodically
+			if ((_accel_interval_mean.valid() && (interval_count % 10 == 0))
+			    && (!PX4_ISFINITE(_accel_interval_best_variance)
+				|| (interval_variance < _accel_interval_best_variance)
+				|| (interval_count > 1000))) {
+
+				const float interval_mean = _accel_interval_mean.mean()(0);
+				const float interval_mean_fifo = _accel_interval_mean.mean()(1);
+
 				// update sample rate if previously invalid or changed
-				const float interval_delta_us = fabsf(_accel_interval_mean.mean()(0) - _accel_interval_us);
+				const float interval_delta_us = fabsf(interval_mean - _accel_interval_us);
 				const float percent_changed = interval_delta_us / _accel_interval_us;
 
 				if (!PX4_ISFINITE(_accel_interval_us) || (percent_changed > 0.001f)) {
-					// update integrator configuration if interval has changed by more than 10%
-					if (interval_delta_us > 0.1f * _accel_interval_us) {
-						_update_integrator_config = true;
+					if (PX4_ISFINITE(interval_mean) && PX4_ISFINITE(interval_mean_fifo) && PX4_ISFINITE(interval_variance)) {
+						// update integrator configuration if interval has changed by more than 10%
+						if (interval_delta_us > 0.1f * _accel_interval_us) {
+							_update_integrator_config = true;
+						}
+
+						_accel_interval_us = interval_mean;
+						_accel_interval_best_variance = interval_variance;
+
+						_status.accel_rate_hz = 1e6f / interval_mean;
+						_status.accel_raw_rate_hz = 1e6f / interval_mean_fifo; // FIFO
+						_publish_status = true;
+
+					} else {
+						_accel_interval_mean.reset();
 					}
-
-					_accel_interval_us = _accel_interval_mean.mean()(0);
-					_accel_interval_best_variance = _accel_interval_mean.variance()(0);
-
-					_status.accel_rate_hz = 1e6f / _accel_interval_mean.mean()(0);
-					_status.accel_raw_rate_hz = 1e6f / _accel_interval_mean.mean()(1); // FIFO
-					_publish_status = true;
 				}
+			}
 
-				if (_accel_interval_mean.count() > 10000) {
-					// reset periodically to prevent numerical issues
-					_accel_interval_mean.reset();
-				}
+			if (interval_count > 10000) {
+				// reset periodically to prevent numerical issues
+				_accel_interval_mean.reset();
 			}
 		}
 
@@ -278,15 +321,25 @@ bool VehicleIMU::UpdateAccel()
 			_status.accel_error_count = accel.error_count;
 		}
 
-		const Vector3f accel_raw{accel.x, accel.y, accel.z};
-		_accel_sum += accel_raw;
-		_accel_temperature += accel.temperature;
-		_accel_sum_count++;
+
+		// temperature average
+		if (_accel_temperature_sum_count == 0) {
+			_accel_temperature_sum = accel.temperature;
+
+		} else {
+			_accel_temperature_sum += accel.temperature;
+		}
+
+		_accel_temperature_sum_count++;
+
 
 		const float dt = (accel.timestamp_sample - _accel_timestamp_sample_last) * 1e-6f;
 		_accel_timestamp_sample_last = accel.timestamp_sample;
 
+		const Vector3f accel_raw{accel.x, accel.y, accel.z};
+		_raw_accel_mean.update(accel_raw);
 		_accel_integrator.put(accel_raw, dt);
+
 		updated = true;
 
 		if (accel.clip_counter[0] > 0 || accel.clip_counter[1] > 0 || accel.clip_counter[2] > 0) {
@@ -322,7 +375,13 @@ bool VehicleIMU::UpdateAccel()
 				const uint64_t clipping_total = _status.accel_clipping[0] + _status.accel_clipping[1] + _status.accel_clipping[2];
 
 				if (clipping_total > _last_clipping_notify_total_count + 1000) {
-					mavlink_log_critical(&_mavlink_log_pub, "Accel %" PRIu8 " clipping, not safe to fly!", _instance);
+					mavlink_log_critical(&_mavlink_log_pub, "Accel %" PRIu8 " clipping, not safe to fly!\t", _instance);
+					/* EVENT
+					 * @description Land now, and check the vehicle setup.
+					 * Clipping can lead to fly-aways.
+					 */
+					events::send<uint8_t>(events::ID("vehicle_imu_accel_clipping"), events::Log::Critical,
+							      "Accel {1} clipping, not safe to fly!", _instance);
 					_last_clipping_notify_time = accel.timestamp_sample;
 					_last_clipping_notify_total_count = clipping_total;
 				}
@@ -350,35 +409,61 @@ bool VehicleIMU::UpdateGyro()
 
 		} else {
 			// collect sample interval average for filters
-			if (_gyro_timestamp_sample_last != 0) {
-				float interval_us = gyro.timestamp_sample - _gyro_timestamp_sample_last;
-				_gyro_interval_mean.update(Vector2f{interval_us, interval_us / gyro.samples});
+			if (gyro.timestamp_sample > _gyro_timestamp_sample_last) {
+				if ((_gyro_timestamp_sample_last != 0) && (gyro.samples > 0)) {
+					float interval_us = gyro.timestamp_sample - _gyro_timestamp_sample_last;
+					_gyro_interval_mean.update(Vector2f{interval_us, interval_us / gyro.samples});
+				}
+
+			} else {
+				PX4_ERR("%d - gyro %" PRIu32 " timestamp error timestamp_sample: %" PRIu64 ", previous timestamp_sample: %" PRIu64,
+					_instance, gyro.device_id, gyro.timestamp_sample, _gyro_timestamp_sample_last);
 			}
 
-			if (_gyro_interval_mean.valid() && (_gyro_interval_mean.count() > 100 || !PX4_ISFINITE(_gyro_interval_best_variance))
-			    && ((_gyro_interval_mean.variance()(0) < _gyro_interval_best_variance) || (_gyro_interval_mean.count() > 1000))) {
+			if (gyro.timestamp < gyro.timestamp_sample) {
+				PX4_ERR("%d - gyro %" PRIu32 " timestamp (%" PRIu64 ") < timestamp_sample (%" PRIu64 ")",
+					_instance, gyro.device_id, gyro.timestamp, gyro.timestamp_sample);
+			}
+
+			const int interval_count = _gyro_interval_mean.count();
+			const float interval_variance = _gyro_interval_mean.variance()(0);
+
+			// check measured interval periodically
+			if ((_gyro_interval_mean.valid() && (interval_count % 10 == 0))
+			    && (!PX4_ISFINITE(_gyro_interval_best_variance)
+				|| (interval_variance < _gyro_interval_best_variance)
+				|| (interval_count > 1000))) {
+
+				const float interval_mean = _gyro_interval_mean.mean()(0);
+				const float interval_mean_fifo = _gyro_interval_mean.mean()(1);
+
 				// update sample rate if previously invalid or changed
-				const float interval_delta_us = fabsf(_gyro_interval_mean.mean()(0) - _gyro_interval_us);
+				const float interval_delta_us = fabsf(interval_mean - _gyro_interval_us);
 				const float percent_changed = interval_delta_us / _gyro_interval_us;
 
 				if (!PX4_ISFINITE(_gyro_interval_us) || (percent_changed > 0.001f)) {
-					// update integrator configuration if interval has changed by more than 10%
-					if (interval_delta_us > 0.1f * _gyro_interval_us) {
-						_update_integrator_config = true;
+					if (PX4_ISFINITE(interval_mean) && PX4_ISFINITE(interval_mean_fifo) && PX4_ISFINITE(interval_variance)) {
+						// update integrator configuration if interval has changed by more than 10%
+						if (interval_delta_us > 0.1f * _gyro_interval_us) {
+							_update_integrator_config = true;
+						}
+
+						_gyro_interval_us = interval_mean;
+						_gyro_interval_best_variance = interval_variance;
+
+						_status.gyro_rate_hz = 1e6f / interval_mean;
+						_status.gyro_raw_rate_hz = 1e6f / interval_mean_fifo; // FIFO
+						_publish_status = true;
+
+					} else {
+						_gyro_interval_mean.reset();
 					}
-
-					_gyro_interval_us = _gyro_interval_mean.mean()(0);
-					_gyro_interval_best_variance = _gyro_interval_mean.variance()(0);
-
-					_status.gyro_rate_hz = 1e6f / _gyro_interval_mean.mean()(0);
-					_status.gyro_raw_rate_hz = 1e6f / _gyro_interval_mean.mean()(1); // FIFO
-					_publish_status = true;
 				}
+			}
 
-				if (_gyro_interval_mean.count() > 10000) {
-					// reset periodically to prevent numerical issues
-					_gyro_interval_mean.reset();
-				}
+			if (interval_count > 10000) {
+				// reset periodically to prevent numerical issues
+				_gyro_interval_mean.reset();
 			}
 		}
 
@@ -392,15 +477,25 @@ bool VehicleIMU::UpdateGyro()
 			_status.gyro_error_count = gyro.error_count;
 		}
 
-		const Vector3f gyro_raw{gyro.x, gyro.y, gyro.z};
-		_gyro_sum += gyro_raw;
-		_gyro_temperature += gyro.temperature;
-		_gyro_sum_count++;
+
+		// temperature average
+		if (_gyro_temperature_sum_count == 0) {
+			_gyro_temperature_sum = gyro.temperature;
+
+		} else {
+			_gyro_temperature_sum += gyro.temperature;
+		}
+
+		_gyro_temperature_sum_count++;
+
 
 		const float dt = (gyro.timestamp_sample - _gyro_timestamp_sample_last) * 1e-6f;
 		_gyro_timestamp_sample_last = gyro.timestamp_sample;
 
+		const Vector3f gyro_raw{gyro.x, gyro.y, gyro.z};
+		_raw_gyro_mean.update(gyro_raw);
 		_gyro_integrator.put(gyro_raw, dt);
+
 		updated = true;
 	}
 
@@ -436,27 +531,34 @@ bool VehicleIMU::Publish()
 
 			// vehicle_imu_status
 			//  publish before vehicle_imu so that error counts are available synchronously if needed
-			if ((_accel_sum_count > 0) && (_gyro_sum_count > 0)
+			if (_raw_accel_mean.valid() && _raw_gyro_mean.valid()
 			    && (_publish_status || (hrt_elapsed_time(&_status.timestamp) >= 100_ms))) {
 
 				_status.accel_device_id = _accel_calibration.device_id();
+
+				// accel mean and variance
+				Vector3f(_accel_calibration.rotation() * _raw_accel_mean.mean()).copyTo(_status.mean_accel);
+				Vector3f(_accel_calibration.rotation() * _raw_accel_mean.variance()).copyTo(_status.var_accel);
+				_raw_accel_mean.reset();
+
+				// accel temperature
+				_status.temperature_accel = _accel_temperature_sum / _accel_temperature_sum_count;
+				_accel_temperature_sum = NAN;
+				_accel_temperature_sum_count = 0;
+
+
 				_status.gyro_device_id = _gyro_calibration.device_id();
 
-				// mean accel
-				const Vector3f accel_mean{_accel_calibration.Correct(_accel_sum / _accel_sum_count)};
-				accel_mean.copyTo(_status.mean_accel);
-				_status.temperature_accel = _accel_temperature / _accel_sum_count;
-				_accel_sum.zero();
-				_accel_temperature = 0;
-				_accel_sum_count = 0;
+				// gyro mean and variance
+				Vector3f(_gyro_calibration.rotation() * _raw_gyro_mean.mean()).copyTo(_status.mean_gyro);
+				Vector3f(_gyro_calibration.rotation() * _raw_gyro_mean.variance()).copyTo(_status.var_gyro);
+				_raw_gyro_mean.reset();
 
-				// mean gyro
-				const Vector3f gyro_mean{_gyro_calibration.Correct(_gyro_sum / _gyro_sum_count)};
-				gyro_mean.copyTo(_status.mean_gyro);
-				_status.temperature_gyro = _gyro_temperature / _gyro_sum_count;
-				_gyro_sum.zero();
-				_gyro_temperature = 0;
-				_gyro_sum_count = 0;
+				// gyro temperature
+				_status.temperature_gyro = _gyro_temperature_sum / _gyro_temperature_sum_count;
+				_gyro_temperature_sum = NAN;
+				_gyro_temperature_sum_count = 0;
+
 
 				_status.timestamp = hrt_absolute_time();
 				_vehicle_imu_status_pub.publish(_status);
@@ -471,7 +573,8 @@ bool VehicleIMU::Publish()
 			delta_angle_corrected.copyTo(imu.delta_angle);
 			delta_velocity_corrected.copyTo(imu.delta_velocity);
 			imu.delta_velocity_clipping = _delta_velocity_clipping;
-			imu.calibration_count = _accel_calibration.calibration_count() + _gyro_calibration.calibration_count();
+			imu.accel_calibration_count = _accel_calibration.calibration_count();
+			imu.gyro_calibration_count = _gyro_calibration.calibration_count();
 			imu.timestamp = hrt_absolute_time();
 			_vehicle_imu_pub.publish(imu);
 
@@ -521,6 +624,7 @@ void VehicleIMU::UpdateIntegratorConfiguration()
 
 			if (gyro_integral_samples % n == 0) {
 				_sensor_gyro_sub.set_required_updates(n);
+				_sensor_gyro_sub.registerCallback();
 
 				_intervals_configured = true;
 				_update_integrator_config = false;
@@ -560,9 +664,10 @@ void VehicleIMU::UpdateGyroVibrationMetrics(const Vector3f &angular_velocity)
 
 void VehicleIMU::PrintStatus()
 {
-	PX4_INFO("%" PRIu8 " - Accel ID: %" PRIu32 ", interval: %.1f us (SD %.1f us), Gyro ID: %" PRIu32
+	PX4_INFO("%" PRIu8 " - Accel: %" PRIu32 ", interval: %.1f us (SD %.1f us), Gyro: %" PRIu32
 		 ", interval: %.1f us (SD %.1f us)",
-		 _instance, _accel_calibration.device_id(), (double)_accel_interval_us, (double)sqrtf(_accel_interval_best_variance),
+		 _instance,
+		 _accel_calibration.device_id(), (double)_accel_interval_us, (double)sqrtf(_accel_interval_best_variance),
 		 _gyro_calibration.device_id(), (double)_gyro_interval_us, (double)sqrtf(_gyro_interval_best_variance));
 
 	PX4_DEBUG("gyro update mean sample latency: %.6f s, publish latency %.6f s, gyro interval %.6f s",
@@ -574,6 +679,185 @@ void VehicleIMU::PrintStatus()
 
 	_accel_calibration.PrintStatus();
 	_gyro_calibration.PrintStatus();
+}
+
+void VehicleIMU::SensorCalibrationUpdate()
+{
+	// State variance assumed for accelerometer bias storage.
+	// This is a reference variance used to calculate the fraction of learned accelerometer bias that will be used to update the stored value.
+	// Larger values cause a larger fraction of the learned biases to be used.
+	static constexpr float max_var_allowed = 1e-3f;
+	static constexpr float max_var_ratio = 1e2f;
+
+	if (_armed) {
+		for (int i = 0; i < _estimator_sensor_bias_subs.size(); i++) {
+			estimator_sensor_bias_s estimator_sensor_bias;
+
+			if (_estimator_sensor_bias_subs[i].update(&estimator_sensor_bias)) {
+				// find corresponding accel bias
+				if (_accel_calibration.device_id() == estimator_sensor_bias.accel_device_id) {
+					const Vector3f bias{estimator_sensor_bias.accel_bias};
+					const Vector3f bias_variance{estimator_sensor_bias.accel_bias_variance};
+
+					const bool valid = (hrt_elapsed_time(&estimator_sensor_bias.timestamp) < 1_s) &&
+							   (estimator_sensor_bias.accel_device_id != 0) &&
+							   estimator_sensor_bias.accel_bias_stable &&
+							   (bias_variance.max() < max_var_allowed) &&
+							   (bias_variance.max() < max_var_ratio * bias_variance.min());
+
+					if (valid) {
+						const Vector3f offset_old{_accel_learned_calibration[i].offset};
+
+						_accel_learned_calibration[i].offset = _accel_calibration.BiasCorrectedSensorOffset(bias);
+						_accel_learned_calibration[i].bias_variance = bias_variance;
+						_accel_learned_calibration[i].valid = true;
+						_accel_cal_available = true;
+
+						if ((offset_old - _accel_learned_calibration[i].offset).longerThan(0.05f)) {
+							PX4_DEBUG("accel %d (%" PRIu32 ") new offset: [%.2f %.2f %.2f] (full bias [%.2f %.2f %.2f])",
+								  _instance, _accel_calibration.device_id(),
+								  (double)_accel_learned_calibration[i].offset(0),
+								  (double)_accel_learned_calibration[i].offset(1),
+								  (double)_accel_learned_calibration[i].offset(2),
+								  (double)bias(0), (double)bias(1), (double)bias(2));
+						}
+
+					} else {
+						_accel_learned_calibration[i].valid = false;
+					}
+				}
+
+				// find corresponding gyro calibration
+				if (_gyro_calibration.device_id() == estimator_sensor_bias.gyro_device_id) {
+					const Vector3f bias{estimator_sensor_bias.gyro_bias};
+					const Vector3f bias_variance{estimator_sensor_bias.gyro_bias_variance};
+
+					const bool valid = (hrt_elapsed_time(&estimator_sensor_bias.timestamp) < 1_s) &&
+							   (estimator_sensor_bias.gyro_device_id != 0) &&
+							   estimator_sensor_bias.gyro_bias_valid &&
+							   estimator_sensor_bias.gyro_bias_stable &&
+							   (bias_variance.max() < max_var_allowed) &&
+							   (bias_variance.max() < max_var_ratio * bias_variance.min());
+
+					if (valid) {
+						const Vector3f offset_old{_gyro_learned_calibration[i].offset};
+
+						_gyro_learned_calibration[i].offset = _gyro_calibration.BiasCorrectedSensorOffset(bias);
+						_gyro_learned_calibration[i].bias_variance = bias_variance;
+						_gyro_learned_calibration[i].valid = true;
+						_gyro_cal_available = true;
+
+						if ((offset_old - _gyro_learned_calibration[i].offset).longerThan(0.01f)) {
+							PX4_DEBUG("gyro %d (%" PRIu32 ") new offset: [%.2f %.2f %.2f] (full bias [%.2f %.2f %.2f])",
+								  _instance, _gyro_calibration.device_id(),
+								  (double)_gyro_learned_calibration[i].offset(0),
+								  (double)_gyro_learned_calibration[i].offset(1),
+								  (double)_gyro_learned_calibration[i].offset(2),
+								  (double)bias(0), (double)bias(1), (double)bias(2));
+						}
+
+					} else {
+						_gyro_learned_calibration[i].valid = false;
+					}
+				}
+			}
+		}
+
+	}
+
+
+	// not armed and accel cal available
+	if (!_armed && _accel_cal_available) {
+		const Vector3f accel_cal_orig{_accel_calibration.offset()};
+		bool initialised = false;
+		Vector3f offset_estimate{};
+		Vector3f bias_variance{};
+
+		// apply all valid saved offsets
+		for (int i = 0; i < ORB_MULTI_MAX_INSTANCES; i++) {
+			if (_accel_learned_calibration[i].valid) {
+				if (!initialised) {
+					bias_variance = _accel_learned_calibration[i].bias_variance;
+					offset_estimate = _accel_learned_calibration[i].offset;
+					initialised = true;
+
+				} else {
+					for (int axis_index = 0; axis_index < 3; axis_index++) {
+						const float sum_of_variances = _accel_learned_calibration[i].bias_variance(axis_index) + bias_variance(axis_index);
+						const float k1 = bias_variance(axis_index) / sum_of_variances;
+						const float k2 = _accel_learned_calibration[i].bias_variance(axis_index) / sum_of_variances;
+						offset_estimate(axis_index) = k2 * offset_estimate(axis_index) + k1 * _accel_learned_calibration[i].offset(axis_index);
+						bias_variance(axis_index) *= k2;
+					}
+				}
+			}
+		}
+
+		if (initialised && (accel_cal_orig - offset_estimate).longerThan(0.05f)) {
+			if (_accel_calibration.set_offset(offset_estimate)) {
+				PX4_INFO("accel %d (%" PRIu32 ") offset committed: [%.2f %.2f %.2f]->[%.2f %.2f %.2f])",
+					 _instance, _accel_calibration.device_id(),
+					 (double)accel_cal_orig(0), (double)accel_cal_orig(1), (double)accel_cal_orig(2),
+					 (double)offset_estimate(0), (double)offset_estimate(1), (double)offset_estimate(2));
+
+				_accel_calibration.ParametersSave();
+			}
+		}
+
+		// reset
+		_accel_cal_available = false;
+
+		for (auto &learned_cal : _accel_learned_calibration) {
+			learned_cal = {};
+		}
+	}
+
+
+	// not armed and gyro cal available
+	if (!_armed && _gyro_cal_available) {
+		const Vector3f gyro_cal_orig{_gyro_calibration.offset()};
+		bool initialised = false;
+		Vector3f offset_estimate{};
+		Vector3f bias_variance{};
+
+		// apply all valid saved offsets
+		for (int i = 0; i < ORB_MULTI_MAX_INSTANCES; i++) {
+			if (_gyro_learned_calibration[i].valid) {
+				if (!initialised) {
+					bias_variance = _gyro_learned_calibration[i].bias_variance;
+					offset_estimate = _gyro_learned_calibration[i].offset;
+					initialised = true;
+
+				} else {
+					for (int axis_index = 0; axis_index < 3; axis_index++) {
+						const float sum_of_variances = _gyro_learned_calibration[i].bias_variance(axis_index) + bias_variance(axis_index);
+						const float k1 = bias_variance(axis_index) / sum_of_variances;
+						const float k2 = _gyro_learned_calibration[i].bias_variance(axis_index) / sum_of_variances;
+						offset_estimate(axis_index) = k2 * offset_estimate(axis_index) + k1 * _gyro_learned_calibration[i].offset(axis_index);
+						bias_variance(axis_index) *= k2;
+					}
+				}
+			}
+		}
+
+		if (initialised && (gyro_cal_orig - offset_estimate).longerThan(0.01f)) {
+			if (_gyro_calibration.set_offset(offset_estimate)) {
+				PX4_INFO("gyro %d (%" PRIu32 ") offset committed: [%.2f %.2f %.2f]->[%.2f %.2f %.2f])",
+					 _instance, _gyro_calibration.device_id(),
+					 (double)gyro_cal_orig(0), (double)gyro_cal_orig(1), (double)gyro_cal_orig(2),
+					 (double)offset_estimate(0), (double)offset_estimate(1), (double)offset_estimate(2));
+
+				_gyro_calibration.ParametersSave();
+			}
+		}
+
+		// reset
+		_gyro_cal_available = false;
+
+		for (auto &learned_cal : _gyro_learned_calibration) {
+			learned_cal = {};
+		}
+	}
 }
 
 } // namespace sensors

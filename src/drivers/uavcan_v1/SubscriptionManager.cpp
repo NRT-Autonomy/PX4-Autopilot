@@ -48,19 +48,23 @@ SubscriptionManager::~SubscriptionManager()
 {
 	UavcanDynamicPortSubscriber *dynsub;
 
-	while (_dynsubscribers != NULL) {
+	while (_dynsubscribers != nullptr) {
 		dynsub = _dynsubscribers;
 		_dynsubscribers = dynsub->next();
 		delete dynsub;
 	}
 }
 
-
 void SubscriptionManager::subscribe()
 {
 	_heartbeat_sub.subscribe();
+
+#if CONFIG_UAVCAN_V1_GETINFO_RESPONDER
 	_getinfo_rsp.subscribe();
+#endif
+
 	_access_rsp.subscribe();
+	_list_rsp.subscribe();
 
 	updateDynamicSubscriptions();
 }
@@ -72,7 +76,7 @@ void SubscriptionManager::updateDynamicSubscriptions()
 		bool found_subscriber = false;
 		UavcanDynamicPortSubscriber *dynsub = _dynsubscribers;
 
-		while (dynsub != NULL) {
+		while (dynsub != nullptr) {
 			// Check if subscriber has already been created
 			const char *subj_name = dynsub->getSubjectName();
 			const uint8_t instance = dynsub->getInstance();
@@ -99,12 +103,12 @@ void SubscriptionManager::updateDynamicSubscriptions()
 			if (port_id <= CANARD_PORT_ID_MAX) { // PortID is set, create a subscriber
 				dynsub = sub.create_sub(_canard_instance, _param_manager);
 
-				if (dynsub == NULL) {
+				if (dynsub == nullptr) {
 					PX4_ERR("Out of memory");
 					return;
 				}
 
-				if (_dynsubscribers == NULL) {
+				if (_dynsubscribers == nullptr) {
 					// Set the head of our linked list
 					_dynsubscribers = dynsub;
 
@@ -112,7 +116,7 @@ void SubscriptionManager::updateDynamicSubscriptions()
 					// Append the new subscriber to our linked list
 					UavcanDynamicPortSubscriber *tmp = _dynsubscribers;
 
-					while (tmp->next() != NULL) {
+					while (tmp->next() != nullptr) {
 						tmp = tmp->next();
 					}
 
@@ -133,7 +137,7 @@ void SubscriptionManager::printInfo()
 {
 	UavcanDynamicPortSubscriber *dynsub = _dynsubscribers;
 
-	while (dynsub != NULL) {
+	while (dynsub != nullptr) {
 		dynsub->printInfo();
 		dynsub = dynsub->next();
 	}
@@ -143,7 +147,7 @@ void SubscriptionManager::updateParams()
 {
 	UavcanDynamicPortSubscriber *dynsub = _dynsubscribers;
 
-	while (dynsub != NULL) {
+	while (dynsub != nullptr) {
 		dynsub->updateParam();
 		dynsub = dynsub->next();
 	}

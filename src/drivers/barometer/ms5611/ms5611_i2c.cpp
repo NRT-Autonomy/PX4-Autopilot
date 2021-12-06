@@ -39,6 +39,8 @@
 
 #include <drivers/device/i2c.h>
 
+#if defined(CONFIG_I2C)
+
 #include "ms5611.h"
 
 class MS5611_I2C : public device::I2C
@@ -141,17 +143,13 @@ MS5611_I2C::ioctl(unsigned operation, unsigned &arg)
 int
 MS5611_I2C::probe()
 {
-	_retries = 10;
-
 	if ((PX4_OK == _probe_address(MS5611_ADDRESS_1)) ||
 	    (PX4_OK == _probe_address(MS5611_ADDRESS_2))) {
-		/*
-		 * Disable retries; we may enable them selectively in some cases,
-		 * but the device gets confused if we retry some of the commands.
-		 */
-		_retries = 0;
+
 		return PX4_OK;
 	}
+
+	_retries = 1;
 
 	return -EIO;
 }
@@ -183,7 +181,7 @@ MS5611_I2C::_reset()
 	int		result;
 
 	/* bump the retry count */
-	_retries = 10;
+	_retries = 3;
 	result = transfer(&cmd, 1, nullptr, 0);
 	_retries = old_retrycount;
 
@@ -193,12 +191,6 @@ MS5611_I2C::_reset()
 int
 MS5611_I2C::_measure(unsigned addr)
 {
-	/*
-	 * Disable retries on this command; we can't know whether failure
-	 * means the device did or did not see the command.
-	 */
-	_retries = 0;
-
 	uint8_t cmd = addr;
 	return transfer(&cmd, 1, nullptr, 0);
 }
@@ -248,3 +240,5 @@ MS5611_I2C::_read_prom()
 	/* calculate CRC and return success/failure accordingly */
 	return (ms5611::crc4(&_prom.c[0]) && !bits_stuck) ? PX4_OK : -EIO;
 }
+
+#endif // CONFIG_I2C
